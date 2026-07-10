@@ -1,0 +1,18 @@
+# Build artifacts / output
+dist/
+dist.zip
+
+# Generated logs
+setup-log.txt
+*.log
+
+# Signing material (never commit certificates or keys)
+*.pfx
+*.snk
+*.p12
+
+# OS / editor cruft
+Thumbs.db
+Desktop.ini
+.vs/
+.vscode/
