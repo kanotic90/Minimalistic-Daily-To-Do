@@ -155,6 +155,10 @@ $script:Anim = @{
 $script:AnimatingIds = @{}
 $script:FadeInIds = @{}
 $script:UndoStack = New-Object System.Collections.Generic.Stack[object]
+# A full list rebuild disposes/recreates every row. If that fires while a drag
+# is settling it would yank controls out from under the animation loop, so we
+# defer it here and flush it once the drag finalizes (see Finalize-DragCommit).
+$script:PendingListUpdate = $false
 
 # Drag-to-reorder state
 $script:DragPending    = $false
@@ -181,6 +185,16 @@ $script:SlideClock  = New-Object System.Diagnostics.Stopwatch
 
 # Active text fades (complete/add/undo), driven by the high-frame-rate loop.
 $script:Fades = New-Object System.Collections.ArrayList
+
+# ---- Action queue -----------------------------------------------------------
+# Serializes state-mutating actions (complete, add, undo) so mashing clicks/keys
+# during animations can't race the data or dispose rows mid-animation. Only ONE
+# action runs at a time; the next can't start until the previous one's animation
+# has settled. The queue is capped — anything past the cap is dropped. Scrolling,
+# hover, and edit-mode all bypass this entirely so the UI never feels frozen.
+$script:ActionQueue = New-Object System.Collections.Generic.Queue[object]
+$script:ActionMax   = 5
+$script:Pumping     = $false   # re-entrancy guard for Pump-Actions
 
 # Inline edit (right-click a task) state
 $script:Editing     = $false
@@ -532,10 +546,18 @@ function Add-TaskFromInput {
     Clear-Placeholder
     $text = $inputBox.Text.Trim()
     if (-not $text) { return }
-    $new = @(Add-Todo $text) | Where-Object { $_.id } | Select-Object -Last 1
-    if ($new) { $script:FadeInIds[[string]$new.id] = $true }
+    # Clear the box right away so typing stays snappy; the actual insert + fade-in
+    # runs through the serial action queue.
     $inputBox.Text = ""
     Restore-Placeholder
+    Enqueue-Action 'add' $text
+}
+
+function Do-AddTask {
+    param([string]$text)
+    if (-not $text) { return }
+    $new = @(Add-Todo $text) | Where-Object { $_.id } | Select-Object -Last 1
+    if ($new) { $script:FadeInIds[[string]$new.id] = $true }
     $script:LastMtime = Get-TodoFileMtime
     Update-List
 }
@@ -715,12 +737,67 @@ function Complete-Fade {
         $script:UndoStack.Push([pscustomobject]@{ Kind = 'complete'; Id = [string]$f.Id })
         $script:AnimatingIds.Remove([string]$f.Id)
         $script:LastMtime = Get-TodoFileMtime
-        Update-List
+        # If a drag is in flight, pull just this finished row out and defer the
+        # full rebuild so the dragged row isn't disposed mid-animation.
+        if ($script:DragActive -or $script:DragSettling) { Detach-RowById $f.Id }
+        Request-ListUpdate
     } else {
         try { $f.Label.ForeColor = $f.LabelTo; $f.Bullet.ForeColor = $f.BulletTo } catch { }
         $script:AnimatingIds.Remove([string]$f.Id)
         Refresh-Hover
     }
+}
+
+# ---- Action queue -----------------------------------------------------------
+
+# True while an action's animation is still playing, so the next action must wait.
+# NOTE: scroll momentum and the scrollbar's length tween are deliberately NOT
+# counted — they're cosmetic and must never gate the user's next action.
+function Action-Blocked {
+    return ($script:Fades.Count -gt 0 -or $script:SlideActive `
+        -or $script:DragActive -or $script:DragSettling)
+}
+
+# Queue a mutating action. Kinds: 'complete' (Data = row id), 'add' (Data = text),
+# 'undo' (no data). Silently drops anything past the cap.
+function Enqueue-Action {
+    param([string]$Kind, $Data = $null)
+    if ($script:ActionQueue.Count -ge $script:ActionMax) { return }
+    $script:ActionQueue.Enqueue([pscustomobject]@{ Kind = $Kind; Data = $Data })
+    Pump-Actions
+}
+
+# Perform one dequeued action. Each may kick off an animation; if it does,
+# Action-Blocked goes true and Pump-Actions stops until it settles.
+function Run-Action {
+    param($a)
+    switch ($a.Kind) {
+        'complete' {
+            $rid = [string]$a.Data
+            $row = Find-RowById $rid
+            if ($null -eq $row) { return }
+            if ($script:AnimatingIds.ContainsKey($rid)) { return }
+            $b = $row.Controls["bullet"]
+            $l = $row.Controls["label"]
+            Start-FadeOut $row $b $l $rid
+        }
+        'add'  { Do-AddTask ([string]$a.Data) }
+        'undo' { Undo-LastComplete }
+    }
+}
+
+# Drain the queue while nothing is in flight. An action that starts an animation
+# ends the drain (Action-Blocked); the render loop re-invokes us once it settles.
+# Instantaneous actions (no animation) drain back-to-back. Re-entrancy-guarded.
+function Pump-Actions {
+    if ($script:Pumping) { return }
+    $script:Pumping = $true
+    try {
+        while ($script:ActionQueue.Count -gt 0 -and -not (Action-Blocked)) {
+            $a = $script:ActionQueue.Dequeue()
+            try { Run-Action $a } catch { }
+        }
+    } finally { $script:Pumping = $false }
 }
 
 # ---- Inline edit (right-click a task) ---------------------------------------
@@ -813,6 +890,9 @@ function Cancel-Edit {
 
 function Undo-LastComplete {
     # Undo the most recent change: a checked-off task (bring it back) or a text edit.
+    # Ignore while a drag is in flight — undo rebuilds the list and starts a
+    # restore-slide, which would collide with the drag's own row animation.
+    if ($script:DragActive -or $script:DragSettling) { return }
     while ($script:UndoStack.Count -gt 0) {
         $action = $script:UndoStack.Pop()
         $id = [string]$action.Id
@@ -855,6 +935,30 @@ function Update-List {
             $listPanel.Invalidate($true)
         }
     }
+}
+
+# A destructive rebuild during an in-flight drag would dispose the row being
+# dragged. Defer it until the drag settles; otherwise rebuild immediately.
+function Request-ListUpdate {
+    if ($script:DragActive -or $script:DragSettling) {
+        $script:PendingListUpdate = $true
+        return
+    }
+    Update-List
+}
+
+# Remove a single row from the live layout WITHOUT a full rebuild. Used when a
+# task's fade-out completes mid-drag: we can't rebuild (that would dispose the
+# dragged row), so we surgically drop just the finished row and let the drag's
+# gap math close over it smoothly. Never detaches the row being dragged.
+function Detach-RowById {
+    param([string]$Id)
+    $r = Find-RowById $Id
+    if ($null -eq $r) { return }
+    if ($r -eq $script:DragRow) { return }
+    $script:RowControls = @($script:RowControls | Where-Object { $_ -ne $r })
+    $script:DragOrder   = @($script:DragOrder   | Where-Object { $_ -ne $r })
+    try { $listPanel.Controls.Remove($r); $r.Dispose() } catch { }
 }
 
 function New-CapsulePath {
@@ -961,6 +1065,7 @@ function Apply-Scroll {
     # Update() then flushes the exposed background strip so nothing smears or
     # leaves trails. Result: text glides at the display's refresh rate, clean.
     foreach ($r in $script:RowControls) {
+        if ($r.IsDisposed) { continue }
         $r.Top = $r.LayoutY - $script:ScrollOffset
     }
     $scrollBar.Invalidate()   # repaint the thumb so it tracks the cursor while dragging the bar
@@ -1075,9 +1180,39 @@ function Len-Frame {
 
 # ---- Drag-to-reorder --------------------------------------------------------
 
+# Snap every in-flight fade to its finished state right now (no waiting for the
+# animation). Fade-outs commit the delete; fade-ins land on their final color.
+# Called at the start of a drag so the reorder always begins from a fully
+# settled, gap-free list — no half-faded rows occupying space to overlap or
+# ghost. Does ONE clean rebuild at the end (safe: no drag is active yet).
+function Flush-Fades {
+    if ($script:Fades.Count -eq 0) { return }
+    $changed = $false
+    foreach ($f in @($script:Fades)) {
+        try { $f.Label.ForeColor = $f.LabelTo; $f.Bullet.ForeColor = $f.BulletTo } catch { }
+        if ($f.Kind -eq 'out') {
+            Toggle-Todo $f.Id
+            $script:UndoStack.Push([pscustomobject]@{ Kind = 'complete'; Id = [string]$f.Id })
+            $changed = $true
+        }
+        $script:AnimatingIds.Remove([string]$f.Id)
+    }
+    $script:Fades.Clear()
+    if ($changed) { $script:LastMtime = Get-TodoFileMtime }
+    Update-List
+}
+
 function Begin-Drag {
     param($row)
     if ($null -eq $row) { return }
+    # Finish any running fades first so the drag starts from a clean layout. This
+    # rebuilds the list, so re-acquire the row we're about to drag by its id.
+    if ($script:Fades.Count -gt 0) {
+        $dragId = [string]$row.Tag
+        Flush-Fades
+        $row = Find-RowById $dragId
+        if ($null -eq $row) { return }   # the row we grabbed was itself deleted
+    }
     $script:DragActive = $true
     $script:DragSettling = $false
     $script:DragRow = $row
@@ -1086,7 +1221,9 @@ function Begin-Drag {
     $script:DragDir = 1
     $script:DragLastCenter = $row.Top + $row.Height / 2.0
     $script:DragClock.Restart()
-    $script:DragOrder = @($script:RowControls)
+    # Belt-and-suspenders: still exclude any (should-be-none) animating rows so a
+    # dying row can never be shuffled as an empty box.
+    $script:DragOrder = @($script:RowControls | Where-Object { $_ -eq $row -or -not $script:AnimatingIds.ContainsKey([string]$_.Tag) })
     foreach ($r in $script:RowControls) {
         $r | Add-Member -NotePropertyName DragTarget -NotePropertyValue $r.Top -Force
         if ($r -ne $row) { $r.Hovered = $false }
@@ -1194,6 +1331,9 @@ function Finalize-DragCommit {
     $script:DragRow = $null
     Position-ScrollBar
     Update-ScrollVisibility
+    # A fade-out (or store change) that completed during the drag deferred its
+    # rebuild — now that we're idle, flush it to fully resync with the store.
+    if ($script:PendingListUpdate) { $script:PendingListUpdate = $false; Update-List }
 }
 
 # One frame of drag motion. Called from mouse-move (at the mouse's polling
@@ -1217,12 +1357,13 @@ function Drag-Frame {
 
     $settled = $true
     $changed = $false
-    if ($script:DragActive -and $dr) {
+    if ($script:DragActive -and $dr -and -not $dr.IsDisposed) {
         $ny = [int]$script:DragDesiredTop
         if ($dr.Top -ne $ny) { $dr.Top = $ny; $changed = $true }
     }
     foreach ($r in $script:RowControls) {
         if ($script:DragActive -and $r -eq $dr) { continue }
+        if ($r.IsDisposed) { continue }
         $cur = $r.Top
         $tgt = [int]$r.DragTarget
         $diff = $tgt - $cur
@@ -1266,6 +1407,7 @@ function Slide-Frame {
     $settled = $true
     $changed = $false
     foreach ($r in $script:RowControls) {
+        if ($r.IsDisposed) { continue }
         $cur = $r.Top
         $tgt = [int]$r.DragTarget
         $diff = $tgt - $cur
@@ -1297,6 +1439,8 @@ function Animate-Frame {
     }
     if ($script:Fades.Count -gt 0) { if (Fade-Frame) { $changed = $true } }
     if ($script:LenActive) { if (Len-Frame) { $changed = $true } }
+    # An action's animation just settled? Start the next queued action.
+    if ($script:ActionQueue.Count -gt 0 -and -not (Action-Blocked)) { Pump-Actions }
     return $changed
 }
 
@@ -1510,9 +1654,7 @@ function Rebuild-Rows {
                 if ($script:SuppressNextComplete) { $script:SuppressNextComplete = $false; return }
                 $r = $script:DragCandidate
                 if ($r -and -not $script:AnimatingIds.ContainsKey([string]$r.Tag)) {
-                    $b = $r.Controls["bullet"]
-                    $l = $r.Controls["label"]
-                    Start-FadeOut $r $b $l $r.Tag
+                    Enqueue-Action 'complete' ([string]$r.Tag)
                 }
             }
         }
@@ -1603,7 +1745,12 @@ function Relayout-Rows {
 }
 
 function Poll-Store {
-    if ($script:DragActive -or $script:DragSettling -or $script:Editing) { return }
+    # Never rebuild while anything is animating or being edited — a rebuild
+    # disposes/recreates rows and would corrupt an in-flight fade/drag/slide/
+    # scroll. The next poll (or the drag's deferred flush) picks up the change.
+    if ($script:DragActive -or $script:DragSettling -or $script:Editing -or
+        $script:SlideActive -or $script:ScrollActive -or $script:LenActive -or
+        $script:Fades.Count -gt 0) { return }
     $mtime = Get-TodoFileMtime
     if ($mtime -ne $script:LastMtime) {
         $script:LastMtime = $mtime
@@ -1635,7 +1782,7 @@ $form.Add_KeyDown({
     param($sender, $e)
     if ($script:Editing) { return }
     if ($e.Control -and $e.KeyCode -eq [System.Windows.Forms.Keys]::Z) {
-        Undo-LastComplete
+        Enqueue-Action 'undo'
         $e.SuppressKeyPress = $true
         $e.Handled = $true
     }
